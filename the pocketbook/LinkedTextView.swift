@@ -14,6 +14,12 @@ final class LinkTextController: ObservableObject {
     /// Set by the editor: picks the first suggestion when Return is pressed mid-mention.
     var acceptFirstSuggestion: (() -> Bool)?
     fileprivate var textDidChange: ((UITextView) -> Void)?
+    fileprivate var commitPending: (() -> Void)?
+
+    /// Writes any text still waiting for the typing pause into the note, e.g. before sharing it.
+    func flush() {
+        commitPending?()
+    }
 
     /// Replaces the `@query` being typed with a complete `@Title `.
     func completeMention(with title: String) {
@@ -64,6 +70,10 @@ struct LinkedTextView: UIViewRepresentable {
 
         controller.textView = textView
         controller.textDidChange = { [weak coordinator = context.coordinator] in coordinator?.textViewDidChange($0) }
+        controller.commitPending = { [weak coordinator = context.coordinator, weak textView] in
+            guard let textView else { return }
+            coordinator?.commit(textView)
+        }
         context.coordinator.restyleAll(textView)
         return textView
     }
@@ -108,8 +118,10 @@ struct LinkedTextView: UIViewRepresentable {
         weak var textView: UITextView?
 
         /// Writing the model on every keystroke re-renders the whole editor and the notebook
-        /// behind it; the text is handed over once typing pauses.
-        private static let commitDelay: TimeInterval = 0.35
+        /// behind it; the text is handed over once typing pauses this long (the timer restarts
+        /// on every keystroke). Ending editing, closing the page, backgrounding the app and
+        /// `LinkTextController.flush()` hand it over at once.
+        private static let commitDelay: TimeInterval = 5
 
         init(_ parent: LinkedTextView) {
             self.parent = parent

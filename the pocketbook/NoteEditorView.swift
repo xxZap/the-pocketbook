@@ -441,6 +441,7 @@ struct NoteEditorView: View {
 
     /// Hands the page to the share sheet as a `.pocketbook` file another notebook can open.
     private func share() {
+        linkController.flush()
         propagateRename()
         do {
             ShareSheet.present(try PageSharing.write(note))
