@@ -93,15 +93,57 @@ enum PageSharing {
         return url
     }
 
-    /// Adds `pages` to the notebook as new pages and sessions and returns them.
+    /// The page or session already in the notebook that `page` would update instead of being added again:
+    /// a page with the same title (links resolve by title, so it is the same page), or a session with the
+    /// same title played the same day.
+    static func match(for page: SharedPage, in notes: [Note]) -> Note? {
+        let title = page.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        func sameTitle(_ note: Note) -> Bool {
+            note.linkTitle.compare(title, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+        }
+        if page.isSession {
+            guard let played = page.playedAt ?? page.createdAt else { return nil }
+            return notes.first { $0.isSession && sameTitle($0) && Calendar.current.isDate($0.playedAt, inSameDayAs: played) }
+        }
+        guard !title.isEmpty else { return nil }
+        return notes.first { !$0.isSession && sameTitle($0) }
+    }
+
+    /// The text of a page after an update brings `incoming`: unchanged when it is already there
+    /// (re-importing the same notebook), the incoming text when it only continues the existing one,
+    /// otherwise the incoming text appended as a new paragraph. What was written here is never removed.
+    static func mergedText(_ existing: String, _ incoming: String) -> String {
+        let addition = incoming.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !addition.isEmpty else { return existing }
+        let base = existing.trimmingCharacters(in: .whitespacesAndNewlines)
+        if base.isEmpty { return incoming }
+        if base.contains(addition) { return existing }
+        if addition.hasPrefix(base) { return addition }
+        return base + "\n\n" + addition
+    }
+
+    /// Adds `pages` to the notebook and returns the notes they became. Pages whose index is a key of
+    /// `updates` are merged into that existing note instead of being added as new pages.
     /// `@links` between the incoming pages follow them when a title has to change;
     /// plain mentions of the existing pages in `linking` become `@links`.
     @discardableResult
-    static func insert(_ pages: [SharedPage], linking: Set<PersistentIdentifier>, notes: [Note],
-                       in context: ModelContext) -> [Note] {
+    static func insert(_ pages: [SharedPage], updates: [Int: Note] = [:], linking: Set<PersistentIdentifier>,
+                       notes: [Note], in context: ModelContext) -> [Note] {
         var takenTitles = notes.filter { !$0.isSession }.map(\.linkTitle)
         var renamed: [(note: Note, from: String)] = []
-        let imported = pages.map { page in
+        var added: [Note] = []
+        let imported = pages.enumerated().map { index, page in
+            // Plain mentions become links before the text lands anywhere, never towards the page itself.
+            let target = updates[index]
+            let mentions = Links.unlinkedMentions(in: page.text, notes: notes)
+                .filter { linking.contains($0.note.persistentModelID) && $0.note.persistentModelID != target?.persistentModelID }
+            let text = Links.linkify(page.text, mentions)
+
+            if let target {
+                merge(page, text: text, into: target, in: context)
+                return target
+            }
+
             let note: Note
             if page.isSession {
                 note = Note(title: page.title, kind: .session)
@@ -113,38 +155,70 @@ enum PageSharing {
             }
             context.insert(note)
 
-            note.text = page.text
+            note.text = text
             note.questionState = QuestionState(rawValue: page.questionState) ?? .none
             if let drawing = page.drawing, (try? PKDrawing(data: drawing)) != nil {
                 note.drawingData = drawing
             }
-            for name in page.tags {
-                if let tag = TagStore.tag(named: name, in: context), !note.hasTag(tag) {
-                    note.tags.append(tag)
-                }
-            }
+            addTags(page.tags, to: note, in: context)
             let created = page.createdAt ?? .now
-            for (offset, data) in page.images.enumerated() {
-                let image = NoteImage(data: data)
-                image.createdAt = created.addingTimeInterval(Double(offset) / 1000) // keeps their order
-                context.insert(image)
-                image.note = note
-            }
+            addImages(page.images, to: note, from: created, in: context)
             note.createdAt = created
             note.updatedAt = page.updatedAt ?? created
+            added.append(note)
             return note
         }
 
-        // Only the incoming pages are link targets here: in their own notebook `@Title` meant one of them.
+        // Only the newly added pages are link targets here: in their own notebook `@Title` meant one of them.
         for (note, oldTitle) in renamed {
-            Links.rename(note, from: oldTitle, to: note.linkTitle, in: imported)
-        }
-        for note in imported {
-            let mentions = Links.unlinkedMentions(in: note.text, notes: notes)
-                .filter { linking.contains($0.note.persistentModelID) }
-            note.text = Links.linkify(note.text, mentions)
+            Links.rename(note, from: oldTitle, to: note.linkTitle, in: added)
         }
         return imported
+    }
+
+    /// Brings what `page` adds into an existing note: text appended (see `mergedText`), tags joined,
+    /// an open or resolved question taken over. Drawing and images arrive only if the note has none,
+    /// so re-importing a notebook never doubles them.
+    private static func merge(_ page: SharedPage, text: String, into note: Note, in context: ModelContext) {
+        var changed = false
+        let merged = mergedText(note.text, text)
+        if merged != note.text {
+            note.text = merged
+            changed = true
+        }
+        let tagCount = note.tags.count
+        addTags(page.tags, to: note, in: context)
+        changed = changed || note.tags.count != tagCount
+        if page.questionState != QuestionState.none.rawValue, page.questionState != note.questionStateRaw {
+            note.questionState = QuestionState(rawValue: page.questionState) ?? note.questionState
+            changed = true
+        }
+        if note.drawing == nil, let drawing = page.drawing, (try? PKDrawing(data: drawing)) != nil {
+            note.drawingData = drawing
+            changed = true
+        }
+        if note.images.isEmpty, !page.images.isEmpty {
+            addImages(page.images, to: note, from: .now, in: context)
+            changed = true
+        }
+        if changed { note.updatedAt = .now }
+    }
+
+    private static func addTags(_ names: [String], to note: Note, in context: ModelContext) {
+        for name in names {
+            if let tag = TagStore.tag(named: name, in: context), !note.hasTag(tag) {
+                note.tags.append(tag)
+            }
+        }
+    }
+
+    private static func addImages(_ images: [Data], to note: Note, from date: Date, in context: ModelContext) {
+        for (offset, data) in images.enumerated() {
+            let image = NoteImage(data: data)
+            image.createdAt = date.addingTimeInterval(Double(offset) / 1000) // keeps their order
+            context.insert(image)
+            image.note = note
+        }
     }
 
     /// Links resolve by title, so an imported page cannot share one with a page already here.
