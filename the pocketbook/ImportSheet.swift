@@ -35,6 +35,8 @@ struct ImportSheet: View {
     @State private var copies: Set<Int> = []
     /// What each matched page would change, worked out once: after importing it would read "nothing".
     @State private var changeSummaries: [Int: String] = [:]
+    /// Whether the text of the matched pages replaces what they say now instead of being appended.
+    @State private var replacingText = false
 
     var body: some View {
         NavigationStack {
@@ -45,13 +47,20 @@ struct ImportSheet: View {
                 let newSessions = indices.filter { matches[$0] == nil && pages[$0].isSession }
                 if !updated.isEmpty {
                     Section {
+                        Picker("Testo", selection: $replacingText) {
+                            Text("Aggiungi in fondo").tag(false)
+                            Text("Sostituisci").tag(true)
+                        }
+                        .pickerStyle(.segmented)
                         ForEach(updated, id: \.self) { index in
                             updateRow(for: index)
                         }
                     } header: {
                         Text(updated.count == 1 ? "Pagina già nel taccuino" : "Pagine già nel taccuino (\(updated.count))")
                     } footer: {
-                        Text("Il testo nuovo viene aggiunto in fondo alla pagina esistente, insieme ai tag; quello che c'è già non viene toccato. Spegni l'interruttore per importarla come copia separata.")
+                        Text(replacingText
+                             ? "Il testo nuovo prende il posto di quello della pagina esistente, che va perso; tag, disegni e immagini restano. Spegni l'interruttore per importarla come copia separata."
+                             : "Il testo nuovo viene aggiunto in fondo alla pagina esistente, insieme ai tag; quello che c'è già non viene toccato. Spegni l'interruttore per importarla come copia separata.")
                     }
                 }
                 if !newPages.isEmpty {
@@ -101,10 +110,10 @@ struct ImportSheet: View {
             }
             .task {
                 matches = findMatches()
-                changeSummaries = matches.mapValues { _ in "" }
-                for (index, note) in matches { changeSummaries[index] = changes(from: pages[index], to: note) }
+                updateChangeSummaries()
                 suggestions = findSuggestions()
             }
+            .onChange(of: replacingText) { updateChangeSummaries() }
         }
     }
 
@@ -142,13 +151,22 @@ struct ImportSheet: View {
         .padding(.vertical, 2)
     }
 
+    private func updateChangeSummaries() {
+        for (index, note) in matches { changeSummaries[index] = changes(from: pages[index], to: note) }
+    }
+
     /// What updating `note` with `page` would change, in words.
     private func changes(from page: SharedPage, to note: Note) -> String {
         var parts: [String] = []
-        let merged = PageSharing.mergedText(note.text, page.text)
-        let added = words(merged) - words(note.text)
+        let merged = PageSharing.updatedText(note.text, page.text, replacing: replacingText)
         if merged != note.text {
-            parts.append(added == 1 ? "aggiunge 1 parola" : "aggiunge \(max(added, 0)) parole")
+            if replacingText {
+                let count = words(merged)
+                parts.append(count == 1 ? "sostituisce il testo (1 parola)" : "sostituisce il testo (\(count) parole)")
+            } else {
+                let added = words(merged) - words(note.text)
+                parts.append(added == 1 ? "aggiunge 1 parola" : "aggiunge \(max(added, 0)) parole")
+            }
         }
         let newTags = page.tags.filter { name in !note.tags.contains { $0.name.caseInsensitiveCompare(name) == .orderedSame } }
         if !newTags.isEmpty { parts.append(newTags.map { "+#" + $0 }.joined(separator: " ")) }
@@ -214,7 +232,7 @@ struct ImportSheet: View {
     private func importPages() {
         let linking = Set(suggestions.map(\.id)).subtracting(skipped)
         let updates = matches.filter { !copies.contains($0.key) }
-        let imported = PageSharing.insert(pages, updates: updates, linking: linking, notes: notes, in: context)
+        let imported = PageSharing.insert(pages, updates: updates, replacingText: replacingText, linking: linking, notes: notes, in: context)
         try? context.save()
         onImport(imported)
         dismiss()

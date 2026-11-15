@@ -122,13 +122,21 @@ enum PageSharing {
         return base + "\n\n" + addition
     }
 
+    /// The text of a page after an update: `incoming` in place of `existing` when replacing (an empty
+    /// incoming text never wipes a page), otherwise `mergedText`.
+    static func updatedText(_ existing: String, _ incoming: String, replacing: Bool) -> String {
+        guard replacing else { return mergedText(existing, incoming) }
+        return incoming.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? existing : incoming
+    }
+
     /// Adds `pages` to the notebook and returns the notes they became. Pages whose index is a key of
     /// `updates` are merged into that existing note instead of being added as new pages.
+    /// With `replacingText`, their text takes the place of the existing one instead of being appended.
     /// `@links` between the incoming pages follow them when a title has to change;
     /// plain mentions of the existing pages in `linking` become `@links`.
     @discardableResult
-    static func insert(_ pages: [SharedPage], updates: [Int: Note] = [:], linking: Set<PersistentIdentifier>,
-                       notes: [Note], in context: ModelContext) -> [Note] {
+    static func insert(_ pages: [SharedPage], updates: [Int: Note] = [:], replacingText: Bool = false,
+                       linking: Set<PersistentIdentifier>, notes: [Note], in context: ModelContext) -> [Note] {
         var takenTitles = notes.filter { !$0.isSession }.map(\.linkTitle)
         var renamed: [(note: Note, from: String)] = []
         var added: [Note] = []
@@ -140,7 +148,7 @@ enum PageSharing {
             let text = Links.linkify(page.text, mentions)
 
             if let target {
-                merge(page, text: text, into: target, in: context)
+                merge(page, text: text, replacingText: replacingText, into: target, in: context)
                 return target
             }
 
@@ -176,12 +184,13 @@ enum PageSharing {
         return imported
     }
 
-    /// Brings what `page` adds into an existing note: text appended (see `mergedText`), tags joined,
+    /// Brings what `page` adds into an existing note: text appended (see `mergedText`) or, with
+    /// `replacingText`, put in place of the old one when it is not empty; tags joined,
     /// an open or resolved question taken over. Drawing and images arrive only if the note has none,
     /// so re-importing a notebook never doubles them.
-    private static func merge(_ page: SharedPage, text: String, into note: Note, in context: ModelContext) {
+    private static func merge(_ page: SharedPage, text: String, replacingText: Bool, into note: Note, in context: ModelContext) {
         var changed = false
-        let merged = mergedText(note.text, text)
+        let merged = updatedText(note.text, text, replacing: replacingText)
         if merged != note.text {
             note.text = merged
             changed = true
