@@ -52,6 +52,7 @@ struct LinkedTextView: UIViewRepresentable {
         textView.alwaysBounceVertical = scrolls
         textView.keyboardDismissMode = .interactive
         textView.delegate = context.coordinator
+        context.coordinator.textView = textView
         textView.accessibilityIdentifier = "noteBody"
         textView.text = text
         textView.setContentHuggingPriority(.defaultLow, for: .vertical)
@@ -63,7 +64,7 @@ struct LinkedTextView: UIViewRepresentable {
 
         controller.textView = textView
         controller.textDidChange = { [weak coordinator = context.coordinator] in coordinator?.textViewDidChange($0) }
-        context.coordinator.restyle(textView)
+        context.coordinator.restyleAll(textView)
         return textView
     }
 
@@ -74,47 +75,130 @@ struct LinkedTextView: UIViewRepresentable {
     }
 
     func updateUIView(_ textView: UITextView, context: Context) {
-        context.coordinator.parent = self
-        // While the keyboard composes an accented letter (dead keys, "`" then "o" → "ò") the
-        // view holds marked text the binding may not have yet; overwriting it would drop the letter.
-        if textView.markedTextRange == nil, textView.text != text {
+        let coordinator = context.coordinator
+        coordinator.parent = self
+        // While the user types, the view is ahead of the binding (writes are debounced):
+        // never overwrite it then. Same while the keyboard composes an accented letter
+        // (dead keys, "`" then "o" → "ò"): overwriting the marked text would drop the letter.
+        if !coordinator.hasPendingCommit, textView.markedTextRange == nil, textView.text != text {
             textView.text = text
+            coordinator.restyleAll(textView)
+        } else if coordinator.linkTitlesChanged() {
+            coordinator.restyleAll(textView)
         }
-        context.coordinator.restyle(textView)
+    }
+
+    /// Pending keystrokes reach the note even when the page closes before the debounce fires.
+    static func dismantleUIView(_ textView: UITextView, coordinator: Coordinator) {
+        coordinator.commit(textView)
     }
 
     final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate {
         var parent: LinkedTextView
         private var links: [NoteLink] = []
+        /// The titles links were last resolved against; a rename elsewhere needs a full restyle.
+        private var styledTitles: Set<String> = []
+        /// What the last keystroke replaced, in the new text: only its paragraph is restyled.
+        private var lastEdit: NSRange?
+        /// A restyle was skipped while the keyboard composed; the next one must cover everything.
+        private var needsFullRestyle = false
+        private var pendingCommit: DispatchWorkItem?
+        private var lastContentHeight: CGFloat = 0
+        private var resignObserver: NSObjectProtocol?
+        weak var textView: UITextView?
+
+        /// Writing the model on every keystroke re-renders the whole editor and the notebook
+        /// behind it; the text is handed over once typing pauses.
+        private static let commitDelay: TimeInterval = 0.35
 
         init(_ parent: LinkedTextView) {
             self.parent = parent
+            super.init()
+            resignObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.willResignActiveNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                guard let self, let textView = self.textView else { return }
+                self.commit(textView)
+            }
         }
 
-        private var baseAttributes: [NSAttributedString.Key: Any] {
+        deinit {
+            if let resignObserver { NotificationCenter.default.removeObserver(resignObserver) }
+        }
+
+        var hasPendingCommit: Bool { pendingCommit != nil }
+
+        /// Hands the text to the binding now, cancelling any scheduled write.
+        func commit(_ textView: UITextView) {
+            pendingCommit?.cancel()
+            pendingCommit = nil
+            let current = textView.text ?? ""
+            if parent.text != current { parent.text = current }
+        }
+
+        private func scheduleCommit(_ textView: UITextView) {
+            pendingCommit?.cancel()
+            let work = DispatchWorkItem { [weak self, textView] in self?.commit(textView) }
+            pendingCommit = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.commitDelay, execute: work)
+        }
+
+        private static let baseAttributes: [NSAttributedString.Key: Any] = {
             let paragraph = NSMutableParagraphStyle()
             paragraph.lineSpacing = 4
             return [.font: LinkedTextView.font, .foregroundColor: UIColor(Theme.ink), .paragraphStyle: paragraph]
+        }()
+
+        private static let linkAttributes: [NSAttributedString.Key: Any] = [
+            .foregroundColor: UIColor(Theme.rust),
+            .underlineStyle: NSUnderlineStyle.single.rawValue,
+            .underlineColor: UIColor(Theme.rust).withAlphaComponent(0.4),
+        ]
+
+        private var currentTitles: Set<String> {
+            Set(parent.notes.lazy.filter { !$0.isSession }.map(\.linkTitle))
         }
 
-        func restyle(_ textView: UITextView) {
+        func linkTitlesChanged() -> Bool {
+            currentTitles != styledTitles
+        }
+
+        func restyleAll(_ textView: UITextView) {
+            restyle(textView, around: nil)
+        }
+
+        /// Colours `@Title` links. With an `edit`, only the paragraphs it touches are re-attributed:
+        /// resetting the whole storage would re-lay out the entire note on every keystroke.
+        private func restyle(_ textView: UITextView, around edit: NSRange?) {
             // Touching attributes while the keyboard composes (marked text) breaks the composition.
-            guard textView.markedTextRange == nil else { return }
-            links = Links.find(in: textView.text, notes: parent.notes)
+            guard textView.markedTextRange == nil else {
+                needsFullRestyle = true
+                return
+            }
             let storage = textView.textStorage
+            let ns = storage.string as NSString
+            styledTitles = currentTitles
+            links = Links.find(in: storage.string, notes: parent.notes)
+
+            var range = NSRange(location: 0, length: storage.length)
+            if let edit, !needsFullRestyle, NSMaxRange(edit) <= ns.length {
+                range = ns.paragraphRange(for: edit)
+                for link in links where NSIntersectionRange(link.range, range).length > 0 {
+                    range = NSUnionRange(range, link.range)
+                }
+            }
+            needsFullRestyle = false
+
             let selection = textView.selectedRange
             storage.beginEditing()
-            storage.setAttributes(baseAttributes, range: NSRange(location: 0, length: storage.length))
+            storage.setAttributes(Self.baseAttributes, range: range)
             for link in links {
-                storage.addAttributes([
-                    .foregroundColor: UIColor(Theme.rust),
-                    .underlineStyle: NSUnderlineStyle.single.rawValue,
-                    .underlineColor: UIColor(Theme.rust).withAlphaComponent(0.4),
-                ], range: link.range)
+                let overlap = NSIntersectionRange(link.range, range)
+                if overlap.length > 0 { storage.addAttributes(Self.linkAttributes, range: overlap) }
             }
             storage.endEditing()
-            textView.selectedRange = selection
-            textView.typingAttributes = baseAttributes
+            if textView.selectedRange != selection { textView.selectedRange = selection }
+            textView.typingAttributes = Self.baseAttributes
         }
 
         private func updateMention(_ textView: UITextView) {
@@ -129,9 +213,19 @@ struct LinkedTextView: UIViewRepresentable {
         }
 
         func textViewDidChange(_ textView: UITextView) {
-            parent.text = textView.text
-            restyle(textView)
+            restyle(textView, around: lastEdit)
+            lastEdit = nil
             updateMention(textView)
+
+            let height = textView.contentSize.height
+            let heightChanged = height != lastContentHeight
+            lastContentHeight = height
+            if parent.text.isEmpty != textView.text.isEmpty || (!parent.scrolls && heightChanged) {
+                // The placeholder and a growing (non-scrolling) text view need SwiftUI right away.
+                commit(textView)
+            } else {
+                scheduleCommit(textView)
+            }
         }
 
         func textViewDidChangeSelection(_ textView: UITextView) {
@@ -139,6 +233,7 @@ struct LinkedTextView: UIViewRepresentable {
         }
 
         func textViewDidEndEditing(_ textView: UITextView) {
+            commit(textView)
             DispatchQueue.main.async { [controller = parent.controller] in controller.mention = nil }
         }
 
@@ -146,6 +241,7 @@ struct LinkedTextView: UIViewRepresentable {
             if text == "\n", parent.controller.mention != nil, parent.controller.acceptFirstSuggestion?() == true {
                 return false
             }
+            lastEdit = NSRange(location: range.location, length: (text as NSString).length)
             return true
         }
 

@@ -4,6 +4,7 @@
 //
 
 import PencilKit
+import SwiftData
 import SwiftUI
 
 /// A note shown as a page of the pocketbook.
@@ -23,7 +24,9 @@ struct NoteCard: View {
             .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(.black.opacity(0.06)))
             .shadow(color: .black.opacity(0.18), radius: 6, x: 0, y: 4)
-            .task(id: note.updatedAt) { await renderThumbnails() }
+            .task(id: ThumbnailSource(drawing: note.drawingData, firstImage: firstImage?.persistentModelID)) {
+                await renderThumbnails()
+            }
     }
 
     @ViewBuilder
@@ -120,19 +123,36 @@ struct NoteCard: View {
         }
     }
 
-    private func renderThumbnails() async {
-        if let drawing = note.drawing {
-            let bounds = drawing.bounds.insetBy(dx: -8, dy: -8)
-            let scale = min(2, 400 / max(bounds.width, bounds.height, 1))
-            thumbnail = drawing.image(from: bounds, scale: scale)
-        } else {
-            thumbnail = nil
-        }
+    /// What the thumbnails are drawn from: typing in the note must not redraw them.
+    private struct ThumbnailSource: Equatable {
+        let drawing: Data
+        let firstImage: PersistentIdentifier?
+    }
 
-        if let data = note.sortedImages.first?.data {
+    private var firstImage: NoteImage? {
+        note.images.min { $0.createdAt < $1.createdAt }
+    }
+
+    private func renderThumbnails() async {
+        let drawingData = note.drawingData
+        thumbnail = await Task.detached { Self.renderDrawing(drawingData) }.value
+
+        if let data = firstImage?.data {
             photo = await Task.detached { ImageCodec.downsample(data, maxPixel: 600) }.value
         } else {
             photo = nil
         }
+    }
+
+    /// Decodes and rasterises the drawing off the main thread, in the canvas's light appearance.
+    nonisolated private static func renderDrawing(_ data: Data) -> UIImage? {
+        guard !data.isEmpty, let drawing = try? PKDrawing(data: data), !drawing.strokes.isEmpty else { return nil }
+        let bounds = drawing.bounds.insetBy(dx: -8, dy: -8)
+        let scale = min(2, 400 / max(bounds.width, bounds.height, 1))
+        var image: UIImage?
+        UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
+            image = drawing.image(from: bounds, scale: scale)
+        }
+        return image
     }
 }

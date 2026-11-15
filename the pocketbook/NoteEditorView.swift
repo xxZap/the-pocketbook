@@ -85,6 +85,8 @@ struct NoteEditorView: View {
     @State private var pickedItems: [PhotosPickerItem] = []
     @State private var visualMode: VisualMode = .drawing
     @State private var shareError: String?
+    /// Decoding the PencilKit drawing is costly: done when it changes, not on every render.
+    @State private var hasDrawing = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -101,7 +103,10 @@ struct NoteEditorView: View {
         .navigationBarTitleDisplayMode(.inline)
         .onChange(of: note.title) { note.updatedAt = .now }
         .onChange(of: note.text) { note.updatedAt = .now }
-        .onChange(of: note.drawingData) { note.updatedAt = .now }
+        .onChange(of: note.drawingData) {
+            note.updatedAt = .now
+            hasDrawing = note.drawing != nil
+        }
         .onChange(of: note.questionStateRaw) { note.updatedAt = .now }
         .onChange(of: pickedItems) { _, items in attach(items) }
         .onChange(of: titleFocused) { _, focused in
@@ -109,10 +114,11 @@ struct NoteEditorView: View {
         }
         .onAppear {
             if linkedTitle == nil { linkedTitle = note.linkTitle }
+            hasDrawing = note.drawing != nil
             note.galleryIndex = min(note.galleryIndex, max(note.images.count - 1, 0))
             if let saved = note.visualModeRaw.flatMap(VisualMode.init(rawValue:)) {
                 visualMode = saved
-            } else if note.drawing == nil && !note.images.isEmpty {
+            } else if !hasDrawing && !note.images.isEmpty {
                 visualMode = .gallery
             }
         }
@@ -327,7 +333,7 @@ struct NoteEditorView: View {
     private var visualAction: some View {
         switch visualMode {
         case .drawing:
-            if note.drawing != nil {
+            if hasDrawing {
                 Button("Pulisci disegno", systemImage: "eraser") { confirmingClear = true }
                     .labelStyle(.iconOnly)
                     .foregroundStyle(Theme.rust)
